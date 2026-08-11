@@ -1,0 +1,8 @@
+interface:
+  display_name: "GitHub 趋势与机会侦察"
+  short_description: "按关键词发现并分析 GitHub 热门项目、技术趋势与商业机会"
+  default_prompt: "Use $find-trending-github-projects to find and analyze the current Top 10 GitHub projects for AI Agent."
+
+policy:
+  allow_implicit_invocation: true
+

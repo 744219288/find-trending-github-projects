@@ -1,0 +1,14 @@
+# 运行时输出（脚本生成的快照 / 报告 / 中间文件）
+github-trend-output/
+*.json.bak
+analysis.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
