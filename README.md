@@ -11,7 +11,7 @@
 
 ## 效果预览
 
-> 卡片式报告（示例：AI 生图方向 · 深度报告 Top 10）
+> 卡片式报告
 
 <img width="1157" height="915" alt="image" src="https://github.com/user-attachments/assets/6c83b04b-8207-4243-b171-58ae22e1cbd0" />
 <img width="1118" height="911" alt="image" src="https://github.com/user-attachments/assets/76af3520-3109-4704-884a-692fe7e893ea" />
