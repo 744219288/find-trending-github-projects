@@ -25,7 +25,6 @@
 git clone https://github.com/744219288/find-trending-github-projects.git ~/.workbuddy/skills/find-trending-github-projects
 ```
 
-克隆后重启 WorkBuddy（或刷新 skill 列表）即可在对话中直接使用。
 
 **方式二：下载发布包（免 git）**
 
