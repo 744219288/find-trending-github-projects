@@ -9,6 +9,13 @@
 - 每个项目一张卡：排名徽章 + 项目名直达链接 + 一句大白话介绍 + Star/Fork/Watch（数字滚动动画）/语言/许可证/更新时间徽章；点卡片展开「详细说明 / 适合谁 / 注意事项 / 二次开发·商业化」。
 - 产出 `report.html`（主交付物，交互卡片页，也是**默认唯一输出文件**）。如需 `report.md`（精简 Markdown）与 `rankings.csv`（Excel 兼容），在 `finalize` 时加 `--keep-extra`；`result.json` 始终保留为结构化快照数据，支持可复现的本地对比。
 
+## 效果预览
+
+> 卡片式报告（示例：AI 生图方向 · 深度报告 Top 10）
+
+![报告顶部预览](https://github.com/744219288/find-trending-github-projects/blob/main/assets/report-top.png?raw=true)
+![报告完整页面预览](https://github.com/744219288/find-trending-github-projects/blob/main/assets/report-full.png?raw=true)
+
 ## 安装
 
 ```bash
