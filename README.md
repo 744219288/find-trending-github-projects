@@ -13,8 +13,10 @@
 
 > 卡片式报告（示例：AI 生图方向 · 深度报告 Top 10）
 
-![报告顶部预览](https://github.com/744219288/find-trending-github-projects/blob/main/assets/report-top.png?raw=true)
-![报告完整页面预览](https://github.com/744219288/find-trending-github-projects/blob/main/assets/report-full.png?raw=true)
+<img width="1157" height="915" alt="image" src="https://github.com/user-attachments/assets/6c83b04b-8207-4243-b171-58ae22e1cbd0" />
+![Uploading image.png…]()
+
+
 
 ## 安装
 
