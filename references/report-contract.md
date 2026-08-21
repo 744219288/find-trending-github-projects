@@ -2,38 +2,60 @@
 
 Read this file before filling `analysis-template.json` or presenting the final report.
 
-## Required order
+## Deliverable shape
 
-1. Title and data banner
-2. Executive summary
-3. Dual-ranking comparison
-4. Factual heat ranking
-5. Comprehensive recommendation ranking
-6. Per-project details
-7. Rejected candidates and reasons
-8. Method, data time, queries, and limitations
+The final user-facing deliverable is **`report.html`** — a self-contained, offline-openable card page (no CDN, no external assets). One card per recommended project, Top N cards for N projects. A slim `report.md` and `rankings.csv` are generated alongside for CLI/Excel users.
 
-## Per-project requirements
+## Card layout (what the user sees)
 
-- Official GitHub link and one-sentence positioning
-- Stars, Forks, primary language, license, and recent push
-- Real delta or explicitly labeled proxy signal
-- Heat, technology, community, commercial, and recommendation scores
-- Verified facts with direct source links
-- Why hot, suitable users, use cases, secondary development, and plausible business models
-- Main risks, confidence, inferences, and any speculation
+Each card, top to bottom:
 
-## Evidence boundaries
+1. Rank badge (uniform amber; ranking comes from the script's data metrics, no special styling for #1)
+2. Project name — direct link to the GitHub repo
+3. `one_liner` — one plain-language sentence saying what the project does and what makes it special
+4. Badge row: Stars / Forks / Watch (animated counters), language, license, last-push date, growth signal
+5. Expandable details (click card): 详细说明 / 适合谁 / 注意事项 / 二次开发·商业化
+
+## Banned from output
+
+- Numeric scores of any kind (technology / community / commercial / heat / recommendation numbers)
+- Dual-ranking comparison tables
+- Executive summaries and long text blocks
+- Footer or header "data source / collection time / auth mode" meta text
+- Dark mode
+
+## analysis.json schema (per project, all required)
+
+```json
+{
+  "full_name": "owner/repo",
+  "one_liner": "≤80 chars, plain Chinese, no jargon",
+  "details": {
+    "explain":   "详细说明：它到底怎么工作、解决什么问题",
+    "suitable":  "适合谁：具体的人群/场景",
+    "cautions":  "注意事项：真实的坑和风险",
+    "business":  "二次开发/商业化：能拿它做什么、许可是否允许"
+  },
+  "facts": [{"claim": "...", "source_url": "https://..."}]
+}
+```
+
+Validation rules enforced by `finalize`:
+
+- `one_liner` non-empty, ≤ 80 characters. If it cannot be said simply, it is wrong.
+- All four `details` blocks non-empty.
+- `facts` optional but every entry needs `claim` + HTTP(S) `source_url`. Facts back the analysis; they are not displayed on cards (only in the Markdown appendix).
+
+## Writing style
+
+- Simplified Chinese, plain language ("大白话"). Explain like talking to a non-engineer friend.
+- No scoring vocabulary, no "热度 X 分", no confidence levels in user-facing text.
+- Project names, license identifiers, and technical terms stay in English.
+- Each `details` block: 1–3 sentences, concrete and specific. No marketing fluff.
+
+## Evidence boundaries (unchanged, still enforced)
 
 - Facts: direct GitHub fields or explicitly cited repository pages.
-- Analysis: a conclusion derived from identified facts.
-- Speculation: uncertain possibility; use sparingly and label it.
-- README claims: project self-description unless corroborated.
 - Commercial claims: never invent customers, revenue, market size, funding, or adoption.
-
-## Language and presentation
-
-Write in Simplified Chinese while preserving project names, license identifiers, and important English technical terms. Lead with conclusions. Keep the method section after the project analysis. If the two rankings differ, explain which technology, community, or commercial factor caused the change.
-
-Display a prominent warning for `stale_snapshot_fallback`. For `cold_start_proxy`, say “首次运行代理热度” and never “近 7 天真实增长.”
-
+- README claims: project self-description unless corroborated.
+- Growth signal wording: `snapshot_delta` → "增速 ≈ 每天 +N 星"; `cold_start_proxy` → "历史热度 ≈ 每天 +N 星" (never claim real recent growth).
