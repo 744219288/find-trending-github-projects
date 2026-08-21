@@ -27,15 +27,9 @@ https://github.com/744219288/find-trending-github-projects.git
 
 **方式二：下载发布包（免 git）**
 
-从 [Releases](https://github.com/744219288/find-trending-github-projects/releases) 下载最新的 `find-trending-github-projects.zip`，解压到 `~/.workbuddy/skills/`，使目录结构为：
+从 [Releases](https://github.com/744219288/find-trending-github-projects/releases) 下载最新的 `find-trending-github-projects.zip`，解压
 
-```
-~/.workbuddy/skills/find-trending-github-projects/SKILL.md
-```
-
-然后重启 WorkBuddy（或刷新 skill 列表）即可。发布包已通过官方 skill 校验（quick_validate），不含 `.git` 等无关内容。
-
-> 也可手动把本仓库内容拷入 `~/.workbuddy/skills/find-trending-github-projects/`。
+发布包已通过官方 skill 校验（quick_validate），不含 `.git` 等无关内容。
 
 ## 前置要求
 
