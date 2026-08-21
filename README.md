@@ -22,8 +22,7 @@
 ## 安装
 
 ```bash
-git clone https://github.com/744219288/find-trending-github-projects.git ~/.workbuddy/skills/find-trending-github-projects
-```
+https://github.com/744219288/find-trending-github-projects.git 
 
 
 **方式二：下载发布包（免 git）**
