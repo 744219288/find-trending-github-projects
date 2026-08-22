@@ -1,13 +1,13 @@
 # find-trending-github-projects
 
-发现并分析 GitHub 上任意关键词下**最新热门 / 快速增长**的仓库，输出**可交互的卡片式 HTML 报告**（自包含单文件、离线双击可开）。默认只生成 `report.html` 一个文件。
+发现并分析 GitHub 上任意关键词下**最新热门 / 快速增长**的仓库，输出**可交互的卡片式 HTML 报告**（自包含单文件、离线双击可开）。run 目录默认只生成 `report.html` 一个报告文件。
 
 ## 它能做什么
 
 - 输入一个关键词（可附带同义词），基于 GitHub 官方数据 + 本地历史快照，找出近 7 天（可配）内最热的 5–20 个仓库。
 - **默认偏新**：热度分混入 15% 的近 30 天新度分，「今天热门」类结果天然偏向新发布项目（老牌仍可凭真实热度上榜，只是排位后移）；`--no-fresh-bias` 切回纯热度口径，`--fresh` 则严格只看新发布。
 - 每个项目一张卡：排名徽章 + 项目名直达链接 + 一句大白话介绍 + Star/Fork/Watch（数字滚动动画）/语言/许可证/更新时间徽章；点卡片展开「详细说明 / 适合谁 / 注意事项 / 二次开发·商业化」。
-- 产出 `report.html`（主交付物，交互卡片页，也是**默认唯一输出文件**）。如需 `report.md`（精简 Markdown）与 `rankings.csv`（Excel 兼容），在 `finalize` 时加 `--keep-extra`；`result.json` 始终保留为结构化快照数据，支持可复现的本地对比。
+- 产出 `report.html`（主交付物，也是 run 目录里的**默认唯一报告文件**）。标准 run 会额外安全复制到相邻 `outputs/`，临时目录不会外溢；可用 `--no-publish` 关闭或用 `--publish-dir` 指定目标。如需 `report.md` 与 `rankings.csv`，在 `finalize` 时加 `--keep-extra`。
 
 ## 效果预览
 
@@ -22,8 +22,8 @@
 ## 安装
 
 ```bash
-https://github.com/744219288/find-trending-github-projects.git 
-
+git clone https://github.com/744219288/find-trending-github-projects.git
+```
 
 **方式二：下载发布包（免 git）**
 
@@ -65,10 +65,13 @@ python scripts/github_trend_scout.py collect \
 # 2) 分析：基于 result.json 填写 analysis.json（一句话 + 四板块，参考 analysis-template.json）
 #    注意 facts 必须是 [{"claim": "...", "source_url": "https://..."}] 对象数组
 
-# 3) 生成报告（默认只输出卡片 report.html；加 --keep-extra 同时生成 report.md + rankings.csv）
+# 3) 生成报告（默认只输出卡片 report.html；标准 run 同时镜像到相邻 outputs）
 python scripts/github_trend_scout.py finalize \
   --run-dir "<上一步打印的 run 目录>" \
   --analysis-file "<run 目录>/analysis.json"
+#    可选：--keep-extra      同时生成 report.md + rankings.csv
+#    可选：--no-publish     不镜像到 outputs
+#    可选：--publish-dir X  把镜像写入指定目录
 
 # 4) （可选）单独重渲染卡片报告
 python scripts/render_card_report.py --run-dir "<run 目录>"
@@ -145,7 +148,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890
 $env:HTTPS_PROXY = "http://127.0.0.1:7890"
 ```
 
-请求失败时错误信息会自动附带网络诊断（代理是否配置、api.github.com 是否可达、建议动作），无需手动排查。
+请求失败时错误信息会自动附带网络诊断（代理是否配置、api.github.com 是否可达、建议动作）。代理 URL 中的用户名、密码、路径和查询参数会先脱敏，绝不会写入 `errors.json`。
 
 ## 提升配额（可选，两分钟搞定）
 
@@ -170,17 +173,18 @@ setx GH_TOKEN ghp_xxxxxxxxxxxx     # Windows（设置后重开终端）
 
 ## 速度与相关度
 
-- **并行加速**：认证模式（gh 登录或 token）下详情抓取默认 4 并发（`GTS_MAX_WORKERS` 可调）；匿名模式强制串行以保护配额。
+- **完整候选补全**：认证模式会先补全全部保留候选，再选 Top N，避免第 N+1 名因尚未抓取维护活跃度而永远无法上榜。匿名模式跳过排名关键的 Release/Issue/PR 调用，并使用扩大候选缓冲区控制配额。
+- **并行加速**：认证模式下详情抓取默认 4 并发（`GTS_MAX_WORKERS` 可调）；匿名模式强制串行以保护配额。
 - **跑题项目治理**：GitHub 搜索有词干化（image 会命中 images），容易混入跑题项目（如搜生图混入截图工具）。脚本会用严格整词匹配复核，覆盖不足半数的项目默认打上 `needs_verification:possible_offtopic` 标记并在分析中说明；确定不要的可用 `--exclude` 精准剔除，或 `--strict-relevance` 一刀切。
 
 ## 额外产出
 
-`finalize` 后默认只生成 `report.html`（零依赖单文件，可直接发给任何人离线打开）；若加 `--keep-extra` 会额外生成 `rankings.csv`（兼容 Excel 的排名表：排名/链接/Star/Fork/Watch/语言/许可证/更新时间/一句话介绍）。关键词根目录下的 `cache/readme.json` 缓存 README，避免对未改动仓库重复抓取。
+`finalize` 后 run 目录默认只生成 `report.html`（零依赖单文件，可直接离线打开）。标准 run 还会向相邻 `outputs/` 原子写入时间戳版和 `latest` 版；临时或任意目录不会自动发布。若加 `--keep-extra`，会额外生成 Markdown 与 Excel 兼容 CSV。README 与仓库/热榜详情分别维护 24 小时缓存时间，互不“续命”。
 
 ## 规则要点
 
 - 仓库文本视为**不可信数据**，不会执行候选仓库的代码、不会克隆或安装它们。
-- 严格区分「事实（facts，带 HTTP(S) 来源链接）」与「推断（inferences）/ 推测（speculations）」，不编造用户数、营收、融资、市场规模等。
+- 严格区分可验证事实与分析判断；只有带 HTTP(S) 来源链接的结论才能放入 `facts`，不编造用户数、营收、融资、市场规模等。
 - 不把「总 Star 数 / Star 除以年龄」等代理指标当作真实近期增长。
 
 ## 许可

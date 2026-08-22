@@ -15,6 +15,8 @@ Search up to four transparent terms: the original keyword plus at most three clo
 
 Merge by case-insensitive `owner/name`. Exclude archived, disabled, mirror, ordinary fork, pure Awesome/list, link collection, and personal-notes repositories. Normally require 20 Stars; lower to 5 only when the topic is narrow and label the result low-sample.
 
+Candidate selection is two-stage. The search response provides the preliminary ordering. In authenticated mode, enrich every retained candidate with repository details, release, Issue/PR activity, and README before choosing Top N. Anonymous mode skips ranking-critical release and Issue/PR calls and enriches a bounded buffer (`max(2 × Top N, Top N + 5)`) to stay within the public quota.
+
 ## Trend modes
 
 ### `snapshot_delta`
@@ -31,6 +33,8 @@ heat =
 ```
 
 Use `delta / max(baseline Stars, 20)` for relative growth to suppress tiny-base explosions.
+
+When only part of the current list exists in the baseline, projects with a baseline use `snapshot_delta`; new entrants use `cold_start_proxy`. Percentiles are normalized inside the applicable cohort only. Missing metrics from the other cohort are never inserted as zero. The per-project `trend.mode` is authoritative, and the report records a limitation explaining the mixed cohort.
 
 ### `cold_start_proxy`
 
@@ -51,48 +55,16 @@ Keep `stars_delta`, `stars_growth_rate`, and `forks_delta` null. Never call this
 
 Use only when current collection fails and a valid prior snapshot exists. Mark the result non-real-time, preserve the old data timestamp, do not write a new snapshot, and do not finalize it as a current commercial report.
 
-## Comprehensive recommendation
+## Pre-analysis recommendation
 
 ```text
 recommendation =
-  30% heat
-+ 25% technology value
-+ 20% community health
-+ 25% commercial potential
+  45% heat
++ 35% maintenance activity
++ 20% freshness and completeness
 ```
 
-Show both rankings. Explain meaningful rank changes.
-
-## Analysis rubrics
-
-### Technology value
-
-- Positioning and differentiation: 25%
-- Usability and completion evidence: 20%
-- Public engineering-quality signals: 20%
-- Extensibility and integrations: 20%
-- Documentation and reproducibility: 15%
-
-### Community health
-
-- Recent maintenance continuity: 30%
-- Issue/PR collaboration signals: 25%
-- Release cadence: 20%
-- Documentation and contribution entry points: 15%
-- Fork and participation breadth: 10%
-
-Do not equate a high raw Issue count with health. Consider responsiveness, recency, and whether activity is capped or incomplete.
-
-### Commercial potential
-
-- Importance of the problem: 20%
-- Target-user clarity: 15%
-- Secondary-development and integration room: 20%
-- Plausible business models: 15%
-- Differentiation and competitive barrier: 15%
-- Inverse license/deployment/dependency risk: 15%
-
-Do not fabricate market size, revenue, funding, customers, or adoption.
+This deterministic order becomes the final card order. Narrative analysis explains the projects but does not inject hidden scores or reorder them.
 
 ## Confidence and credibility
 
@@ -100,5 +72,4 @@ Do not fabricate market size, revenue, funding, customers, or adoption.
 - Medium: complete current official data but no history, or conclusions mainly rely on project self-description.
 - Low: small sample, missing fields, partial API coverage, or stale data.
 
-Keep confidence separate from score. Star/Fork imbalance, growth discontinuity, minimal repository content, or absent collaboration may add `needs_verification`; never use these signals alone to accuse manipulation or automatically exclude a project.
-
+Confidence is internal reasoning guidance and is not written into `analysis.json` or shown on cards. Star/Fork imbalance, growth discontinuity, minimal repository content, or absent collaboration may add `needs_verification`; never use these signals alone to accuse manipulation or automatically exclude a project.

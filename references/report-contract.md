@@ -4,7 +4,9 @@ Read this file before filling `analysis-template.json` or presenting the final r
 
 ## Deliverable shape
 
-The final user-facing deliverable is **`report.html`** — a self-contained, offline-openable card page (no CDN, no external assets). One card per recommended project, Top N cards for N projects. A slim `report.md` and `rankings.csv` are generated alongside for CLI/Excel users.
+The final user-facing deliverable is **`report.html`** — a self-contained, offline-openable card page (no CDN, no external assets). One card per recommended project, Top N cards for N projects. By default it is the only report file generated in the run directory. Pass `finalize --keep-extra` to additionally generate `report.md` and `rankings.csv`.
+
+Standard script-created run directories are safely mirrored to the adjacent `outputs/` directory as timestamped and `latest` HTML files. Temporary or arbitrary run directories are never auto-published. Use `--publish-dir` for an explicit destination or `--no-publish` to keep the report only inside the run directory.
 
 ## Card layout (what the user sees)
 

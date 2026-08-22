@@ -214,6 +214,49 @@ def atomic_write_text(path: Path, value: str) -> None:
             os.unlink(temp_name)
 
 
+def _default_publish_dir(run_dir: Path) -> Path | None:
+    """Return the user-facing outputs directory only for a known run layout.
+
+    Arbitrary directories (especially TemporaryDirectory-based tests) must never
+    publish into the current working directory or the user's global Codex folder.
+    """
+    resolved = run_dir.resolve()
+    try:
+        if resolved.parent.name == "runs":
+            output_root = resolved.parents[2]
+        elif resolved.parent.name in {"daily", "weekly", "monthly"} and resolved.parents[1].name == "_trending":
+            output_root = resolved.parents[2]
+        else:
+            return None
+    except IndexError:
+        return None
+    return output_root.parent / "outputs"
+
+
+def _published_report_paths(run_dir: Path, keyword: str, publish_dir: Path | None = None) -> list[Path]:
+    target_dir = publish_dir.resolve() if publish_dir is not None else _default_publish_dir(run_dir)
+    if target_dir is None:
+        return []
+    keyword_slug = slugify(keyword or "trend")
+    run_name = run_dir.name
+    return [
+        target_dir / f"github-trend-report-{keyword_slug}-{run_name}.html",
+        target_dir / f"github-trend-report-{keyword_slug}-latest.html",
+    ]
+
+
+def _publish_report(report_path: Path, run_dir: Path, keyword: str, publish_dir: Path | None = None) -> list[Path]:
+    published: list[Path] = []
+    payload = report_path.read_text(encoding="utf-8")
+    for target in _published_report_paths(run_dir, keyword, publish_dir):
+        try:
+            atomic_write_text(target, payload)
+        except OSError:
+            continue
+        published.append(target)
+    return published
+
+
 def run_process(command: list[str], *, timeout: int = 60, allow_failure: bool = False) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -328,7 +371,18 @@ def _network_diagnosis() -> str:
     hints: list[str] = []
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
     if proxy:
-        hints.append(f"当前走代理 {proxy}，请确认代理可用")
+        parsed = urllib.parse.urlsplit(proxy)
+        if parsed.hostname:
+            host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+            try:
+                parsed_port = parsed.port
+            except ValueError:
+                parsed_port = None
+            port = f":{parsed_port}" if parsed_port else ""
+            safe_proxy = f"{parsed.scheme or 'proxy'}://{host}{port}"
+        else:
+            safe_proxy = "已配置（地址已脱敏）"
+        hints.append(f"当前走代理 {safe_proxy}，请确认代理可用")
     else:
         hints.append("未配置代理；网络受限环境可设置 HTTPS_PROXY 环境变量后重试")
     try:
@@ -758,10 +812,31 @@ def _cached_detail(full_name: str, now: dt.datetime, *, allow_degraded: bool = T
         return None
     if entry.get("anonymous") and not allow_degraded:
         return None
-    fetched = parse_time(entry.get("fetched_at"))
+    fetched = parse_time(entry.get("detail_fetched_at") or entry.get("fetched_at"))
     if not fetched or (now - fetched).total_seconds() > DETAIL_CACHE_TTL_HOURS * 3600:
         return None
     return entry
+
+
+def _store_detail_cache(
+    full_name: str,
+    *,
+    now: dt.datetime,
+    repo_updates: dict[str, Any],
+    latest_release: dict[str, Any] | None,
+    anonymous: bool,
+) -> None:
+    entry = dict(_DETAIL_CACHE.get(full_name) or {})
+    entry.update(
+        {
+            "fetched_at": iso_z(now),  # compatibility with caches written before 1.3
+            "detail_fetched_at": iso_z(now),
+            "repo_updates": repo_updates,
+            "latest_release": latest_release,
+            "anonymous": anonymous,
+        }
+    )
+    _DETAIL_CACHE[full_name] = entry
 
 
 def _detail_repo_updates(details: dict[str, Any]) -> dict[str, Any]:
@@ -818,7 +893,7 @@ def activity_score(project: dict[str, Any], now: dt.datetime) -> float:
     issues = float(activity.get("issues_updated") or 0)
     prs = float(activity.get("pull_requests_updated") or 0)
     collaboration = clamp(100.0 * math.log1p(issues + 2.0 * prs) / math.log1p(40.0))
-    if not activity:
+    if not activity or activity.get("degraded"):
         collaboration = 35.0
     return round1(0.55 * push + 0.20 * release_score + 0.25 * collaboration)
 
@@ -871,7 +946,7 @@ def score_projects(projects: list[dict[str, Any]], *, baseline: dict[str, Any] |
                 "stars_growth_rate": round(relative, 6),
                 "forks_delta": fork_delta,
             }
-            metrics.append({"abs": float(star_delta), "rel": relative, "fork": float(fork_delta), "activity": activity, "freshness": freshness, "bias": bias})
+            metrics.append({"abs": float(star_delta), "rel": relative, "fork_delta": float(fork_delta), "activity": activity, "freshness": freshness, "bias": bias})
         else:
             age = max(days_since(repo.get("created_at"), now), 1.0)
             project["trend"] = {
@@ -884,10 +959,20 @@ def score_projects(projects: list[dict[str, Any]], *, baseline: dict[str, Any] |
                 "forks_delta": None,
                 "proxy": {"stars_per_age_day": round(repo["stars"] / age, 6)},
             }
-            metrics.append({"maturity": math.log1p(repo["stars"]), "speed": math.log1p(repo["stars"] / age), "fork": math.log1p(repo["forks"]), "activity": activity, "freshness": freshness, "bias": bias})
+            metrics.append({"maturity": math.log1p(repo["stars"]), "speed": math.log1p(repo["stars"] / age), "fork_traction": math.log1p(repo["forks"]), "activity": activity, "freshness": freshness, "bias": bias})
 
     def pct(key: str) -> list[float]:
-        return percentile_scores([float(metric.get(key, 0.0)) for metric in metrics])
+        """Normalize only within projects that actually have this metric.
+
+        A partial historical baseline produces a snapshot cohort and a cold-start
+        cohort. Treating the other cohort as zero corrupts both percentile scales.
+        """
+        result = [0.0] * len(metrics)
+        applicable = [(index, float(metric[key])) for index, metric in enumerate(metrics) if key in metric]
+        scores = percentile_scores([value for _, value in applicable])
+        for (index, _), score in zip(applicable, scores):
+            result[index] = score
+        return result
 
     pct_maps = {key: pct(key) for key in {key for metric in metrics for key in metric}}
     for index, project in enumerate(projects):
@@ -896,7 +981,7 @@ def score_projects(projects: list[dict[str, Any]], *, baseline: dict[str, Any] |
             breakdown = {
                 "absolute_star_growth": round1(pct_maps["abs"][index]),
                 "relative_star_growth": round1(pct_maps["rel"][index]),
-                "fork_growth": round1(pct_maps["fork"][index]),
+                "fork_growth": round1(pct_maps["fork_delta"][index]),
                 "maintenance_activity": round1(metric["activity"]),
                 "freshness_completeness": round1(metric["freshness"]),
             }
@@ -905,7 +990,7 @@ def score_projects(projects: list[dict[str, Any]], *, baseline: dict[str, Any] |
             breakdown = {
                 "current_star_maturity": round1(pct_maps["maturity"][index]),
                 "age_normalized_star_proxy": round1(pct_maps["speed"][index]),
-                "fork_traction": round1(pct_maps["fork"][index]),
+                "fork_traction": round1(pct_maps["fork_traction"][index]),
                 "maintenance_activity": round1(metric["activity"]),
                 "freshness_completeness": round1(metric["freshness"]),
             }
@@ -997,7 +1082,7 @@ def enrich_project(project: dict[str, Any], *, now: dt.datetime) -> list[dict[st
                 details = gh_json(endpoint, timeout=60)
                 updates = _detail_repo_updates(details)
                 project["repo"].update(updates)
-                _DETAIL_CACHE[full_name] = {"fetched_at": iso_z(now), "repo_updates": updates, "latest_release": None, "anonymous": True}
+                _store_detail_cache(full_name, now=now, repo_updates=updates, latest_release=None, anonymous=True)
             except GhError as exc:
                 errors.append({"stage": "repo_details", "repo": full_name, "message": str(exc), "detail": exc.stderr[:500], "retryable": True})
     else:
@@ -1017,7 +1102,13 @@ def enrich_project(project: dict[str, Any], *, now: dt.datetime) -> list[dict[st
             except GhError as exc:
                 errors.append({"stage": "release", "repo": full_name, "message": str(exc), "detail": exc.stderr[:500], "retryable": True})
             if updates is not None:
-                _DETAIL_CACHE[full_name] = {"fetched_at": iso_z(now), "repo_updates": updates, "latest_release": project.get("latest_release")}
+                _store_detail_cache(
+                    full_name,
+                    now=now,
+                    repo_updates=updates,
+                    latest_release=project.get("latest_release"),
+                    anonymous=False,
+                )
 
         since = iso_z(now - dt.timedelta(days=30))
         try:
@@ -1070,6 +1161,12 @@ def enrich_projects(projects: list[dict[str, Any]], *, now: dt.datetime) -> list
         for sub_errors in pool.map(lambda p: enrich_project(p, now=now), projects):
             errors.extend(sub_errors)
     return errors
+
+
+def enrichment_pool_size(filtered_count: int, count: int, *, anonymous: bool) -> int:
+    if not anonymous:
+        return filtered_count
+    return min(filtered_count, max(count * 2, count + 5))
 
 
 def load_json(path: Path) -> Any:
@@ -1206,10 +1303,22 @@ def degraded_from_snapshot(snapshot: dict[str, Any], *, keyword: str, days: int,
 
 
 MAX_RUNS_PER_KEYWORD = 10
+RUN_DIR_PATTERN = re.compile(r"^\d{8}T\d{6}Z(?:-\d+)?$")
 try:
     MAX_RUNS_PER_KEYWORD = max(1, int(os.environ.get("GTS_MAX_RUNS", MAX_RUNS_PER_KEYWORD)))
 except (TypeError, ValueError):
     pass
+
+
+def allocate_run_id(runs_dir: Path, now: dt.datetime) -> str:
+    """Allocate a sortable run id without overwriting a same-second run."""
+    base = now.strftime("%Y%m%dT%H%M%SZ")
+    if not (runs_dir / base).exists():
+        return base
+    suffix = 2
+    while (runs_dir / f"{base}-{suffix:02d}").exists():
+        suffix += 1
+    return f"{base}-{suffix:02d}"
 
 
 def prune_runs(runs_dir: Path, *, keep: int = MAX_RUNS_PER_KEYWORD) -> list[str]:
@@ -1220,7 +1329,15 @@ def prune_runs(runs_dir: Path, *, keep: int = MAX_RUNS_PER_KEYWORD) -> list[str]
     """
     if not runs_dir.is_dir():
         return []
-    runs = sorted((d for d in runs_dir.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True)
+    runs = sorted(
+        (
+            d
+            for d in runs_dir.iterdir()
+            if d.is_dir() and not d.is_symlink() and RUN_DIR_PATTERN.fullmatch(d.name)
+        ),
+        key=lambda d: d.name,
+        reverse=True,
+    )
     keep = max(1, keep)
     removed: list[str] = []
     for old in runs[keep:]:
@@ -1282,7 +1399,7 @@ def _load_runs(runs_dir: Path) -> list[tuple[Path, dict[str, Any]]]:
             payload = load_json(result_path)
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(payload, dict) and payload.get("projects"):
+        if isinstance(payload, dict) and isinstance(payload.get("projects"), list):
             loaded.append((run, payload))
     return loaded
 
@@ -1429,9 +1546,9 @@ def watch_command(args: argparse.Namespace) -> int:
 
 def collect_command(args: argparse.Namespace) -> int:
     started = utc_now()
-    run_id = started.strftime("%Y%m%dT%H%M%SZ")
     keyword_slug = slugify(args.keyword)
     root = Path(args.output_root).expanduser().resolve() / keyword_slug
+    run_id = allocate_run_id(root / "runs", started)
     run_dir = root / "runs" / run_id
     snapshot_dir = root / "snapshots"
     _load_readme_cache(root / "cache" / "readme.json")
@@ -1472,6 +1589,31 @@ def collect_command(args: argparse.Namespace) -> int:
         print(str(run_dir))
         return 0
 
+    if not any(successes.values()):
+        stale = latest_valid_snapshot(snapshot_dir, keyword=args.keyword)
+        if stale:
+            result = degraded_from_snapshot(
+                stale,
+                keyword=args.keyword,
+                days=args.days,
+                count=args.count,
+                errors=errors,
+                run_id=run_id,
+                now=started,
+            )
+            run_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(run_dir / "result.json", result)
+            atomic_write_json(run_dir / "errors.json", errors)
+            atomic_write_json(run_dir / "analysis-template.json", analysis_template(result["projects"]))
+            print("[提示] 所有搜索请求均失败，已回退到最近有效快照。", file=sys.stderr)
+            print(str(run_dir))
+            return 0
+        run_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(run_dir / "errors.json", errors)
+        print("ERROR: 所有 GitHub 搜索请求均失败，且没有可用旧快照。", file=sys.stderr)
+        print(f"错误记录：{run_dir / 'errors.json'}", file=sys.stderr)
+        return 2
+
     for project in candidates:
         project["relevance_score"] = relevance_score(project, args.keyword)
     candidates, exclude_rejected = apply_excludes(candidates, excludes)
@@ -1497,9 +1639,13 @@ def collect_command(args: argparse.Namespace) -> int:
 
     score_projects(filtered, baseline=baseline, now=started, days=args.days, fresh_bias=fresh_bias)
     filtered.sort(key=lambda item: (item["scores"]["heat"], item["relevance_score"], item["repo"]["stars"]), reverse=True)
-    shortlist_size = min(len(filtered), args.count)
+    anonymous_mode = _is_anonymous()
+    # Ranking-critical Issue/PR and release activity is available only in authenticated mode,
+    # so enrich every retained candidate there before choosing Top N. Anonymous mode skips
+    # those fields and uses a larger buffer to keep request count and latency bounded.
+    shortlist_size = enrichment_pool_size(len(filtered), args.count, anonymous=anonymous_mode)
     shortlist = filtered[:shortlist_size]
-    detail_cache_hits = sum(1 for p in shortlist if _cached_detail(p["repo"]["full_name"], started, allow_degraded=_is_anonymous()) is not None)
+    detail_cache_hits = sum(1 for p in shortlist if _cached_detail(p["repo"]["full_name"], started, allow_degraded=anonymous_mode) is not None)
     enrich_started = time.monotonic()
     errors.extend(enrich_projects(shortlist, now=started))
     enrich_seconds = round(time.monotonic() - enrich_started, 1)
@@ -1514,11 +1660,13 @@ def collect_command(args: argparse.Namespace) -> int:
     core_fields_ok = bool(top) and all(p["repo"]["full_name"] and p["repo"]["stars"] >= 0 and p["repo"]["forks"] >= 0 and p["repo"]["created_at"] for p in top)
     valid_snapshot = pool_ok and core_fields_ok
     limitations: list[str] = []
-    anonymous_mode = _is_anonymous()
     if anonymous_mode:
         limitations.append("匿名模式（未配置 token）：使用 GitHub 未认证配额，已跳过 release / 近 30 天 Issue-PR 活跃度等非关键详情；配置 GH_TOKEN 可获得完整数据。")
     if mode == "cold_start_proxy":
         limitations.append("没有合格历史快照；热度为首次运行代理分，不代表真实近 7 天增长。")
+    project_trend_modes = {p.get("trend", {}).get("mode") for p in top}
+    if "snapshot_delta" in project_trend_modes and "cold_start_proxy" in project_trend_modes:
+        limitations.append("部分新入榜项目在历史快照中不存在，已按冷启动代理口径单独归一化；有历史记录的项目仍使用真实快照增量。")
     if low_sample:
         limitations.append(f"结果不足以维持星数门槛，已降至 {threshold} Stars；低样本项目置信度需下调。")
     if errors:
@@ -1533,7 +1681,7 @@ def collect_command(args: argparse.Namespace) -> int:
         "run": {"id": run_id, "started_at": iso_z(started), "completed_at": iso_z(completed), "mode": mode, "data_as_of": iso_z(completed), "auth_route": auth_route, "anonymous": anonymous_mode, "is_valid_snapshot": valid_snapshot},
         "input": {"keyword": args.keyword, "time_range_days": args.days, "count": args.count, "language": args.language, "exclude_terms": excludes, "strict_relevance": strict_relevance, "fresh_days": fresh_days, "fresh_bias": fresh_bias, "repository_types": ["application", "tool", "framework", "library", "model", "dataset"]},
         "queries": [{"text": item["query"], "kind": item["pool"], "term": item["term"], "term_weight": item["term_weight"], "sort": item["sort"], "limit": item["limit"]} for item in plan],
-        "collection": {"candidate_count": len(candidates), "filtered_count": len(filtered), "shortlist_count": len(shortlist), "dynamic_star_threshold": threshold, "low_sample": low_sample, "pool_successes": successes, "degraded": False, "detail_cache_hits": detail_cache_hits, "enrich_seconds": enrich_seconds},
+        "collection": {"candidate_count": len(candidates), "filtered_count": len(filtered), "shortlist_count": len(shortlist), "enrichment_count": len(shortlist), "dynamic_star_threshold": threshold, "low_sample": low_sample, "pool_successes": successes, "degraded": False, "detail_cache_hits": detail_cache_hits, "enrich_seconds": enrich_seconds},
         "rankings": {"heat": [p["repo"]["full_name"] for p in top], "recommendation": [], "pre_analysis_recommendation": [p["repo"]["full_name"] for p in pre_order]},
         "projects": top,
         "rejected_candidates": rejected[:100],
@@ -1570,13 +1718,18 @@ DETAIL_KEYS = ("explain", "suitable", "cautions", "business")
 
 
 def validate_analysis(analysis: dict[str, Any], expected: set[str]) -> dict[str, dict[str, Any]]:
+    if not isinstance(analysis, dict):
+        raise ScoutError("analysis.json 顶层必须是对象。")
     projects = analysis.get("projects")
     if not isinstance(projects, list):
         raise ScoutError("analysis.projects 必须是数组。")
     mapped: dict[str, dict[str, Any]] = {}
     seen: set[str] = set()
     problems: list[str] = []
-    for item in projects:
+    for project_index, item in enumerate(projects, start=1):
+        if not isinstance(item, dict):
+            problems.append(f"projects 第 {project_index} 项必须是对象，不能是 {type(item).__name__}")
+            continue
         name = str(item.get("full_name") or "")
         key = name.casefold()
         if key not in expected:
@@ -1599,7 +1752,13 @@ def validate_analysis(analysis: dict[str, Any], expected: set[str]) -> dict[str,
             missing_fields = [f for f in DETAIL_KEYS if not str(details.get(f) or "").strip()]
             if missing_fields:
                 item_problems.append(f"「{name}」details 空板块：{', '.join(missing_fields)} 还没填写")
-        for idx, fact in enumerate(item.get("facts", []) or [], start=1):
+        facts = item.get("facts", [])
+        if facts is None:
+            facts = []
+        if not isinstance(facts, list):
+            item_problems.append(f"「{name}」facts 必须是数组")
+            facts = []
+        for idx, fact in enumerate(facts, start=1):
             if isinstance(fact, str):
                 problems.append(
                     f"「{name}」facts 第 {idx} 项是字符串：必须改成对象格式 "
@@ -1734,6 +1893,8 @@ def finalize_command(args: argparse.Namespace) -> int:
     result = load_json(result_path)
     if result.get("run", {}).get("mode") == "stale_snapshot_fallback":
         raise ScoutError("旧快照降级结果缺少实时证据，不应生成完整商业分析报告。")
+    if not isinstance(result.get("projects"), list) or not result["projects"]:
+        raise ScoutError("本次结果没有可生成卡片的项目，不能 finalize。请放宽条件后重新采集。")
     analysis = load_json(Path(args.analysis_file).expanduser().resolve())
     expected = {p["repo"]["full_name"].casefold() for p in result["projects"]}
     mapped = validate_analysis(analysis, expected)
@@ -1764,6 +1925,18 @@ def finalize_command(args: argparse.Namespace) -> int:
             extra_path = run_dir / extra
             if extra_path.exists():
                 extra_path.unlink()
+    published: list[Path] = []
+    if not bool(getattr(args, "no_publish", False)):
+        raw_publish_dir = getattr(args, "publish_dir", None)
+        publish_dir = Path(raw_publish_dir).expanduser().resolve() if raw_publish_dir else None
+        published = _publish_report(
+            run_dir / "report.html",
+            run_dir,
+            result.get("input", {}).get("keyword", "trend"),
+            publish_dir,
+        )
+    for index, published_path in enumerate(published):
+        print(f"published={published_path}" if index == 0 else str(published_path))
     print(str(run_dir / "report.html"))
     return 0
 
@@ -1958,8 +2131,8 @@ def _trending_detail(full_name: str, *, now: dt.datetime) -> tuple[dict[str, Any
     """
     cached = _DETAIL_CACHE.get(full_name)
     if isinstance(cached, dict):
-        fetched = parse_time(cached.get("fetched_at"))
         stored = cached.get("trending_detail")
+        fetched = parse_time(cached.get("trending_fetched_at") or (cached.get("fetched_at") if stored else None))
         if fetched and isinstance(stored, dict) and (now - fetched).total_seconds() <= DETAIL_CACHE_TTL_HOURS * 3600:
             return stored, True
     try:
@@ -1980,7 +2153,7 @@ def _trending_detail(full_name: str, *, now: dt.datetime) -> tuple[dict[str, Any
         "open_issues": int(item.get("open_issues_count") or 0),
     }
     entry = dict(cached) if isinstance(cached, dict) else {}
-    entry["fetched_at"] = iso_z(now)
+    entry["trending_fetched_at"] = iso_z(now)
     entry["trending_detail"] = detail
     _DETAIL_CACHE[full_name] = entry
     return detail, False
@@ -1989,8 +2162,11 @@ def _trending_detail(full_name: str, *, now: dt.datetime) -> tuple[dict[str, Any
 def _readme_excerpt_for(full_name: str, *, now: dt.datetime) -> dict[str, Any] | None:
     """取仓库 README 摘要（带缓存），供分析阶段参考；失败/无 README 返回 None。"""
     cached = _README_CACHE.get(full_name)
-    if cached and cached.get("readme"):
-        return cached["readme"]
+    if cached and isinstance(cached.get("readme"), dict):
+        excerpt = cached["readme"]
+        fetched = parse_time(excerpt.get("fetched_at"))
+        if fetched and (now - fetched).total_seconds() <= DETAIL_CACHE_TTL_HOURS * 3600:
+            return excerpt
     try:
         readme = gh_raw(f"repos/{full_name}/readme", timeout=60, allow_404=True)
     except GhError:
@@ -2081,6 +2257,7 @@ def trending_command(args: argparse.Namespace) -> int:
     count = args.count
     language = args.language
     trending_root = Path(args.output_root).expanduser().resolve() / "_trending"
+    run_id = allocate_run_id(trending_root / window, started)
     # 热榜专用缓存（详情 24h / README）：热榜仓库日复一日高度重复，跨 run 命中率高
     _load_readme_cache(trending_root / "cache" / "readme.json")
     _load_detail_cache(trending_root / "cache" / "repo-details.json")
@@ -2094,6 +2271,8 @@ def trending_command(args: argparse.Namespace) -> int:
         print(f"[提示] 抓取 Trending 页面失败，回退到搜索 API 近似榜：{exc}", file=sys.stderr)
         degraded = True
         repos = _trending_fallback_repos(window, language=language, count=count)
+    if not repos:
+        raise ScoutError("GitHub Trending 与搜索 API 回退均未返回项目，请稍后重试。")
     repos = repos[:count]
     projects: list[dict[str, Any]] = []
     for rank, meta in enumerate(repos, start=1):
@@ -2156,7 +2335,7 @@ def trending_command(args: argparse.Namespace) -> int:
     auth_route = "direct_gh" if _active_transport() == "gh" else ("direct_api_anonymous" if _is_anonymous() else "direct_api_token")
     result = {
         "schema_version": SCHEMA_VERSION,
-        "run": {"id": started.strftime("%Y%m%dT%H%M%SZ"), "started_at": iso_z(started), "completed_at": iso_z(completed), "mode": "trending", "data_as_of": iso_z(completed), "auth_route": auth_route, "anonymous": _is_anonymous(), "is_valid_snapshot": False},
+        "run": {"id": run_id, "started_at": iso_z(started), "completed_at": iso_z(completed), "mode": "trending", "data_as_of": iso_z(completed), "auth_route": auth_route, "anonymous": _is_anonymous(), "is_valid_snapshot": False},
         "input": {"mode": "trending", "window": window, "language": language, "count": count, "source": "github_trending_scrape" if not degraded else "api_approx_fallback"},
         "queries": [{"text": "github.com/trending", "kind": "trending_scrape", "term": "", "term_weight": 1.0, "sort": "trending_rank", "order": "desc", "limit": count}],
         "collection": {"candidate_count": len(repos), "filtered_count": len(projects), "shortlist_count": len(projects), "dynamic_star_threshold": None, "low_sample": len(projects) < count, "pool_successes": {"trending": 1 if repos else 0}, "degraded": degraded, "detail_cache_hits": detail_cache_hits, "detail_failed": detail_failed, "enrich_seconds": enrich_seconds},
@@ -2171,7 +2350,7 @@ def trending_command(args: argparse.Namespace) -> int:
         ],
         "errors": [],
     }
-    run_dir = trending_root / window / started.strftime("%Y%m%dT%H%M%SZ")
+    run_dir = trending_root / window / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(run_dir / "result.json", result)
     atomic_write_json(run_dir / "analysis-template.json", analysis_template(projects))
@@ -2267,7 +2446,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--exclude", action="append", default=[], help="排除词，可重复：命中的仓库（名称/描述/主题子串匹配）直接剔除，如 --exclude screenshot --exclude 录屏。")
     collect.add_argument("--strict-relevance", action="store_true", dest="strict_relevance", help="严格相关度：关键词分词覆盖不足半数的疑似跑题项目直接剔除（默认仅打标保留）。")
     collect.add_argument("--fresh", action="store_true", dest="fresh", help="新度门限：仅保留创建于近 --fresh-days 天内的项目（只看新发布，排除 openclaw 这类老牌）。")
-    collect.add_argument("--fresh-days", type=int, default=FRESH_DEFAULT_DAYS, help=f"新度门限天数（配合 --fresh；默认 {FRESH_DEFAULT_DAYS}）。")
+    collect.add_argument("--fresh-days", type=int, default=FRESH_DEFAULT_DAYS, choices=range(1, 366), metavar="1..365", help=f"新度门限天数（配合 --fresh；默认 {FRESH_DEFAULT_DAYS}）。")
     collect.add_argument("--no-fresh-bias", action="store_true", dest="no_fresh_bias", help="关闭默认偏新软偏置（默认开启：热度分混入 15%% 的近 30 天新度分，结果偏新发布；关闭后回到纯热度口径，老牌高星仓库可能垄断榜单）。")
     collect.add_argument("--transport", choices=["auto", "gh", "api"], default="auto", help="采集传输层：auto（默认，优先 gh CLI，否则用纯 API；无 token 自动匿名）/ gh（仅 gh CLI）/ api（仅纯 API；无 token 时匿名模式）。")
     collect.add_argument("--output-root", default=str(Path.cwd() / "github-trend-output"))
@@ -2282,7 +2461,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--exclude", action="append", default=[], help="排除词，可重复。")
     watch.add_argument("--strict-relevance", action="store_true", dest="strict_relevance")
     watch.add_argument("--fresh", action="store_true", dest="fresh", help="新度门限：仅保留创建于近 --fresh-days 天内的项目。")
-    watch.add_argument("--fresh-days", type=int, default=FRESH_DEFAULT_DAYS, help=f"新度门限天数（配合 --fresh；默认 {FRESH_DEFAULT_DAYS}）。")
+    watch.add_argument("--fresh-days", type=int, default=FRESH_DEFAULT_DAYS, choices=range(1, 366), metavar="1..365", help=f"新度门限天数（配合 --fresh；默认 {FRESH_DEFAULT_DAYS}）。")
     watch.add_argument("--no-fresh-bias", action="store_true", dest="no_fresh_bias", help="关闭默认偏新软偏置（与 collect 语义一致；注意与基线保持同口径，否则增量噪音大）。")
     watch.add_argument("--transport", choices=["auto", "gh", "api"], default="auto")
     watch.add_argument("--output-root", default=str(Path.cwd() / "github-trend-output"))
@@ -2309,6 +2488,8 @@ def build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--run-dir", required=True)
     finalize.add_argument("--analysis-file", required=True)
     finalize.add_argument("--keep-extra", action="store_true", help="同时保留 report.md 与 rankings.csv（默认只生成卡片 report.html，并清理这两个文件）。")
+    finalize.add_argument("--publish-dir", help="额外复制报告到指定目录；默认仅对脚本生成的标准 run 目录自动发布到相邻 outputs。")
+    finalize.add_argument("--no-publish", action="store_true", help="不复制报告到 outputs；只保留 run 目录内的 report.html。")
     finalize.set_defaults(func=finalize_command)
 
     compact = subparsers.add_parser("compact-history", help="汇总超期快照；默认只做 dry-run。")

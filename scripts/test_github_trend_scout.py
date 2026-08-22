@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import io
 import json
 import os
 import shutil
@@ -125,6 +126,25 @@ class ScoutUnitTests(unittest.TestCase):
         self.assertEqual(projects[0]["trend"]["stars_delta"], 30)
         self.assertEqual(projects[0]["trend"]["window_actual_days"], 6.5)
 
+    def test_mixed_snapshot_percentiles_are_scoped_to_each_cohort(self) -> None:
+        projects = [
+            project("org/a", 110, 11),
+            project("org/b", 130, 14),
+            project("org/c", 50, 5),
+            project("org/d", 100, 10),
+        ]
+        baseline = {
+            "captured_at": scout.iso_z(NOW - dt.timedelta(days=7)),
+            "projects": [
+                {"repo": {"full_name": "org/a", "stars": 100, "forks": 10}},
+                {"repo": {"full_name": "org/b", "stars": 100, "forks": 10}},
+            ],
+        }
+        mode = scout.score_projects(projects, baseline=baseline, now=NOW, days=7)
+        self.assertEqual(mode, "snapshot_delta")
+        self.assertEqual(projects[0]["scores"]["breakdown"]["absolute_star_growth"], 0.0)
+        self.assertEqual(projects[2]["scores"]["breakdown"]["current_star_maturity"], 0.0)
+
     def test_credibility_flags_do_not_exclude(self) -> None:
         item = project("org/suspicious", stars=1000, forks=1)
         item["repo"]["open_issues"] = 0
@@ -182,20 +202,53 @@ class ScoutUnitTests(unittest.TestCase):
         self.assertIn("org/b", message)
         self.assertIn("共 5 处问题", message)
 
+    def test_analysis_rejects_non_object_project_without_traceback(self) -> None:
+        with self.assertRaises(scout.ScoutError) as ctx:
+            scout.validate_analysis({"projects": [None]}, {"org/a"})
+        self.assertIn("必须是对象", str(ctx.exception))
+
+    def test_network_diagnosis_redacts_proxy_credentials(self) -> None:
+        import urllib.error
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"HTTPS_PROXY": "http://demo-user:demo-pass@proxy.example:8080"},
+            clear=False,
+        ), unittest.mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("blocked")):
+            message = scout._network_diagnosis()
+        self.assertNotIn("demo-user", message)
+        self.assertNotIn("demo-pass", message)
+        self.assertIn("proxy.example:8080", message)
+
     def test_prune_runs_keeps_newest_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             runs_dir = Path(temp) / "runs"
-            for i in range(12):
-                (runs_dir / f"2026010{i:02d}T000000Z").mkdir(parents=True)
+            for day in range(1, 13):
+                (runs_dir / f"202601{day:02d}T000000Z").mkdir(parents=True)
+            unrelated = runs_dir / "notes"
+            unrelated.mkdir()
             removed = scout.prune_runs(runs_dir, keep=10)
             self.assertEqual(len(removed), 2)
-            remaining = sorted(d.name for d in runs_dir.iterdir())
+            remaining = sorted(d.name for d in runs_dir.iterdir() if scout.RUN_DIR_PATTERN.fullmatch(d.name))
             self.assertEqual(len(remaining), 10)
             self.assertNotIn(removed[0], remaining)
+            self.assertTrue(unrelated.is_dir())
             # keep 至少为 1
             removed_again = scout.prune_runs(runs_dir, keep=0)
             self.assertEqual(len(remaining) - len(removed_again), 1)
-            self.assertEqual(len(list(runs_dir.iterdir())), 1)
+            self.assertEqual(len([d for d in runs_dir.iterdir() if scout.RUN_DIR_PATTERN.fullmatch(d.name)]), 1)
+            self.assertTrue(unrelated.is_dir())
+
+    def test_allocate_run_id_avoids_same_second_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            runs = Path(temp)
+            (runs / "20260810T080000Z").mkdir()
+            (runs / "20260810T080000Z-02").mkdir()
+            self.assertEqual(scout.allocate_run_id(runs, NOW), "20260810T080000Z-03")
+
+    def test_enrichment_pool_covers_all_authenticated_candidates(self) -> None:
+        self.assertEqual(scout.enrichment_pool_size(80, 10, anonymous=False), 80)
+        self.assertEqual(scout.enrichment_pool_size(80, 10, anonymous=True), 20)
 
     def test_latest_run_reports_freshness_and_skips_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -273,6 +326,17 @@ class ScoutUnitTests(unittest.TestCase):
             # 默认只出卡片 HTML：report.md / rankings.csv 不应生成
             self.assertFalse((run_dir / "report.md").exists())
             self.assertFalse((run_dir / "rankings.csv").exists())
+            self.assertEqual(scout._published_report_paths(run_dir, "AI Agent"), [])
+
+    def test_publish_report_is_bounded_to_standard_run_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "github-trend-output" / "ai-agent" / "runs" / "20260810T080000Z"
+            report = run_dir / "report.html"
+            scout.atomic_write_text(report, "<html>ok</html>")
+            published = scout._publish_report(report, run_dir, "AI Agent")
+            self.assertEqual(len(published), 2)
+            self.assertTrue(all(path.parent == Path(temp) / "outputs" for path in published))
+            self.assertTrue(all(path.is_file() for path in published))
 
     def test_finalize_keep_extra_emits_md_and_csv(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -311,6 +375,23 @@ class ScoutUnitTests(unittest.TestCase):
             csv_text = (run_dir / "rankings.csv").read_text(encoding="utf-8-sig")
             self.assertIn("watchers", csv_text)
             self.assertIn("one_liner", csv_text)
+
+    def test_finalize_rejects_empty_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp)
+            scout.atomic_write_json(
+                run_dir / "result.json",
+                {"run": {"mode": "cold_start_proxy"}, "projects": [], "rankings": {}},
+            )
+            scout.atomic_write_json(run_dir / "analysis.json", {"projects": []})
+            with self.assertRaises(scout.ScoutError) as ctx:
+                scout.finalize_command(
+                    argparse.Namespace(
+                        run_dir=str(run_dir),
+                        analysis_file=str(run_dir / "analysis.json"),
+                    )
+                )
+            self.assertIn("没有可生成卡片", str(ctx.exception))
 
     def test_renderer_escapes_html_and_hides_missing_badges(self) -> None:
         from render_card_report import render_card_report
@@ -428,6 +509,107 @@ class ScoutUnitTests(unittest.TestCase):
             scout._load_detail_cache(cache_path)
             self.assertIsNotNone(scout._cached_detail("org/full", now))
 
+    def test_trending_refresh_does_not_revive_stale_collect_cache(self) -> None:
+        scout._DETAIL_CACHE.clear()
+        try:
+            old = NOW - dt.timedelta(hours=30)
+            scout._DETAIL_CACHE["org/x"] = {
+                "fetched_at": scout.iso_z(old),
+                "detail_fetched_at": scout.iso_z(old),
+                "repo_updates": {"subscribers": 1},
+                "latest_release": {"tag": "v-old"},
+            }
+            response = {
+                "created_at": "2020-01-01T00:00:00Z",
+                "license": {"spdx_id": "MIT"},
+                "subscribers_count": 2,
+                "open_issues_count": 3,
+            }
+            with unittest.mock.patch.object(scout, "gh_json", return_value=response):
+                scout._trending_detail("org/x", now=NOW)
+            self.assertIsNone(scout._cached_detail("org/x", NOW))
+            self.assertEqual(scout._DETAIL_CACHE["org/x"]["latest_release"]["tag"], "v-old")
+        finally:
+            scout._DETAIL_CACHE.clear()
+
+    def test_trending_readme_cache_obeys_ttl(self) -> None:
+        scout._README_CACHE.clear()
+        try:
+            scout._README_CACHE["org/x"] = {
+                "pushed_at": None,
+                "readme": {
+                    "fetched_at": scout.iso_z(NOW - dt.timedelta(hours=30)),
+                    "content_excerpt": "old",
+                },
+            }
+            with unittest.mock.patch.object(scout, "gh_raw", return_value="new readme") as fetch:
+                excerpt = scout._readme_excerpt_for("org/x", now=NOW)
+            fetch.assert_called_once()
+            self.assertEqual(excerpt["content_excerpt"], "new readme")
+        finally:
+            scout._README_CACHE.clear()
+
+    def test_all_search_failures_fall_back_to_valid_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "kw"
+            snapshot = {
+                "captured_at": scout.iso_z(NOW - dt.timedelta(days=1)),
+                "is_valid_snapshot": True,
+                "input": {"keyword": "kw"},
+                "queries": [],
+                "projects": [{"repo": project("org/old")["repo"]}],
+            }
+            scout.atomic_write_json(root / "snapshots" / "old.json", snapshot)
+            args = argparse.Namespace(
+                keyword="kw",
+                term=[],
+                days=7,
+                count=5,
+                language=None,
+                exclude=[],
+                strict_relevance=False,
+                fresh=False,
+                fresh_days=30,
+                no_fresh_bias=False,
+                transport="api",
+                output_root=temp,
+            )
+            failures = [{"stage": "search", "message": "network failed"}]
+            successes = {pool: 0 for pool in scout.POOL_QUOTAS}
+            with unittest.mock.patch.object(scout, "utc_now", return_value=NOW), \
+                 unittest.mock.patch.object(scout, "check_auth", return_value=None), \
+                 unittest.mock.patch.object(scout, "collect_queries", return_value=([], failures, successes)):
+                rc = scout.collect_command(args)
+            self.assertEqual(rc, 0)
+            run = root / "runs" / "20260810T080000Z"
+            result = scout.load_json(run / "result.json")
+            self.assertEqual(result["run"]["mode"], "stale_snapshot_fallback")
+            self.assertEqual(result["projects"][0]["repo"]["full_name"], "org/old")
+
+    def test_all_search_failures_without_snapshot_return_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            args = argparse.Namespace(
+                keyword="kw",
+                term=[],
+                days=7,
+                count=5,
+                language=None,
+                exclude=[],
+                strict_relevance=False,
+                fresh=False,
+                fresh_days=30,
+                no_fresh_bias=False,
+                transport="api",
+                output_root=temp,
+            )
+            failures = [{"stage": "search", "message": "network failed"}]
+            successes = {pool: 0 for pool in scout.POOL_QUOTAS}
+            with unittest.mock.patch.object(scout, "utc_now", return_value=NOW), \
+                 unittest.mock.patch.object(scout, "check_auth", return_value=None), \
+                 unittest.mock.patch.object(scout, "collect_queries", return_value=([], failures, successes)):
+                rc = scout.collect_command(args)
+            self.assertEqual(rc, 2)
+
     def test_history_compaction_is_dry_run_by_default_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -490,19 +672,35 @@ class ScoutUnitTests(unittest.TestCase):
             old_run = runs_dir / "20260801T000000Z"
             new_run = runs_dir / "20260802T000000Z"
             old_run.mkdir(parents=True)
-            new_run.mkdir(parents=True)
             base_project = project("org/a")
             old_result = {"run": {"mode": "cold_start_proxy", "completed_at": "2026-08-01T00:00:00Z"}, "input": {"keyword": "kw", "fresh_days": None}, "projects": [base_project]}
             new_result = {"run": {"mode": "cold_start_proxy", "completed_at": "2026-08-02T00:00:00Z"}, "input": {"keyword": "kw", "fresh_days": 7}, "projects": []}
             scout.atomic_write_json(old_run / "result.json", old_result)
-            scout.atomic_write_json(new_run / "result.json", new_result)
             args = argparse.Namespace(keyword="kw", output_root=tmp, days=7, count=10, transport="api")
-            with unittest.mock.patch.object(scout, "collect_command", return_value=0):
+
+            def fake_collect(_args: argparse.Namespace) -> int:
+                new_run.mkdir(parents=True)
+                scout.atomic_write_json(new_run / "result.json", new_result)
+                return 0
+
+            with unittest.mock.patch.object(scout, "collect_command", side_effect=fake_collect):
                 rc = scout.watch_command(args)
             self.assertEqual(rc, 0)
             summary = (new_run / "watch-summary.md").read_text(encoding="utf-8")
             self.assertIn("掉榜", summary)
             self.assertIn("org/a", summary)
+
+    def test_zero_project_watch_run_is_loaded_as_next_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / "runs" / "20260801T000000Z"
+            run.mkdir(parents=True)
+            scout.atomic_write_json(
+                run / "result.json",
+                {"run": {"mode": "cold_start_proxy"}, "projects": []},
+            )
+            loaded = scout._load_runs(Path(tmp) / "runs")
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0][1]["projects"], [])
 
     def test_trending_query_windows_languages_and_star_gates(self) -> None:
         now = dt.datetime(2026, 8, 10, tzinfo=dt.timezone.utc)
@@ -517,6 +715,13 @@ class ScoutUnitTests(unittest.TestCase):
 
 
 class ScoutFreshnessTests(unittest.TestCase):
+    def test_fresh_days_rejects_nonpositive_values(self) -> None:
+        parser = scout.build_parser()
+        with self.assertRaises(SystemExit), unittest.mock.patch("sys.stderr", new=io.StringIO()):
+            parser.parse_args(["collect", "--keyword", "AI", "--fresh", "--fresh-days", "0"])
+        with self.assertRaises(SystemExit), unittest.mock.patch("sys.stderr", new=io.StringIO()):
+            parser.parse_args(["watch", "--keyword", "AI", "--fresh", "--fresh-days", "-1"])
+
     def test_fresh_days_keeps_new_and_rejects_old(self) -> None:
         new = project("org/fresh", stars=200, created_days=3)
         old = project("org/old", stars=99999, created_days=400)
@@ -726,6 +931,15 @@ class ScoutTrendingCommandTests(unittest.TestCase):
             result = json.loads(Path(run_dirs[0], "result.json").read_text(encoding="utf-8"))
             self.assertTrue(result["collection"]["degraded"])
             self.assertEqual(result["projects"][0]["trend"]["mode"], "trending_api_approx")
+
+    def test_trending_command_rejects_empty_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(scout, "scrape_github_trending", side_effect=scout.ScoutError("blocked")), \
+                 unittest.mock.patch.object(scout, "_trending_fallback_repos", return_value=[]), \
+                 unittest.mock.patch.object(scout, "_is_anonymous", return_value=False):
+                with self.assertRaises(scout.ScoutError) as ctx:
+                    scout.trending_command(self._args(tmp))
+            self.assertIn("均未返回项目", str(ctx.exception))
 
     def test_trending_detail_hits_cache_within_ttl(self) -> None:
         scout._DETAIL_CACHE.clear()
